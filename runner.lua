@@ -1,80 +1,72 @@
 -- TAS Runner GUI
--- Compatible with Potassium Executor
--- Auto-loads config list from GitHub repository
+-- Drop your .json config files into: <Executor>/workspace/TAS_Configs/
+-- Compatible with Potassium and most executors
 
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local HttpService    = game:GetService("HttpService")
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
 
-local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local LocalPlayer      = Players.LocalPlayer
+local Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-local Humanoid = Character:WaitForChild("Humanoid")
 
 -- ============================================================
--- CONFIG
+-- FOLDER SETUP
 -- ============================================================
--- Index file in your repo: a JSON array of config names (without .json extension)
--- e.g. ["skytopiabest1", "skytopiabest2"]
-local CONFIG_INDEX = "https://raw.githubusercontent.com/domstealthgit/mount-runs-tas/refs/heads/main/configs.json"
-local RAW_BASE     = "https://raw.githubusercontent.com/domstealthgit/mount-runs-tas/refs/heads/main/"
+local FOLDER = "TAS_Configs"
+
+if not isfolder(FOLDER) then
+    makefolder(FOLDER)
+    print("[TAS] Created folder: workspace/" .. FOLDER .. "  — drop your .json files in there!")
+end
 
 -- ============================================================
 -- STATE
 -- ============================================================
-local isRunning    = false
-local runThread    = nil
-local configs      = {}        -- { name = "skytopiabest1", url = "..." }
-local selectedIdx  = 1
-local dropOpen     = false
+local isRunning   = false
+local runThread   = nil
+local configs     = {}   -- { name, path }
+local selectedIdx = 1
+local dropOpen    = false
 
 -- ============================================================
 -- HELPERS
 -- ============================================================
 local function arraytoCF(t)
-    -- t = { x, y, z, qx, qy, qz, qw }
     local pos = Vector3.new(t[1], t[2], t[3])
-    local rot = CFrame.new(pos) * CFrame.fromQuaternion(t[4], t[5], t[6], t[7])
-    return rot
+    return CFrame.new(pos) * CFrame.fromQuaternion(t[4], t[5], t[6], t[7])
 end
 
-local function fetchConfigs()
-    local ok, result = pcall(function()
-        return HttpService:GetAsync(CONFIG_INDEX)
-    end)
-    if not ok then
-        warn("[TAS] Could not fetch configs.json: " .. tostring(result))
-        return
-    end
-    local names = HttpService:JSONDecode(result)
+local function scanConfigs()
     configs = {}
-    for _, name in ipairs(names) do
-        table.insert(configs, {
-            name = name,
-            url  = RAW_BASE .. name .. ".json"
-        })
+    local files = listfiles(FOLDER)
+    for _, path in ipairs(files) do
+        local name = path:match("([^/\\]+)%.json$")
+        if name then
+            table.insert(configs, { name = name, path = path })
+        end
     end
+    table.sort(configs, function(a, b) return a.name < b.name end)
 end
 
 local function loadConfig(cfg)
-    local ok, result = pcall(function()
-        return HttpService:GetAsync(cfg.url)
-    end)
-    if not ok then
-        warn("[TAS] Failed to load config: " .. tostring(result))
+    local ok, raw = pcall(readfile, cfg.path)
+    if not ok or not raw or raw == "" then
+        warn("[TAS] Could not read file: " .. cfg.path)
         return nil
     end
-    return HttpService:JSONDecode(result)
+    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 then
+        warn("[TAS] JSON parse error in: " .. cfg.path)
+        return nil
+    end
+    return data
 end
 
 -- ============================================================
 -- TAS PLAYBACK
 -- ============================================================
 local function playback(frames)
-    -- frames is the outer array; each element is an array of keyframes
-    -- Each keyframe: { CF, RV, CCF, HS, T, V }
-    -- Flatten all keyframes into one sorted list by T
     local allFrames = {}
     for _, segment in ipairs(frames) do
         for _, chunk in ipairs(segment) do
@@ -85,13 +77,12 @@ local function playback(frames)
     end
     table.sort(allFrames, function(a, b) return a.T < b.T end)
 
-    local camera = workspace.CurrentCamera
+    local camera    = workspace.CurrentCamera
     local startTime = tick()
 
     for _, kf in ipairs(allFrames) do
         if not isRunning then break end
 
-        -- Wait until the right time
         local targetTime = startTime + kf.T
         while tick() < targetTime do
             if not isRunning then break end
@@ -99,42 +90,22 @@ local function playback(frames)
         end
         if not isRunning then break end
 
-        -- Apply CFrame to character root
-        if kf.CF then
-            HumanoidRootPart.CFrame = arraytoCF(kf.CF)
-        end
-
-        -- Apply velocity
-        if kf.V then
-            HumanoidRootPart.AssemblyLinearVelocity = Vector3.new(kf.V[1], kf.V[2], kf.V[3])
-        end
-
-        -- Apply rotational velocity
-        if kf.RV then
-            HumanoidRootPart.AssemblyAngularVelocity = Vector3.new(kf.RV[1], kf.RV[2], kf.RV[3])
-        end
-
-        -- Apply camera CFrame
-        if kf.CCF then
-            camera.CFrame = arraytoCF(kf.CCF)
-        end
+        if kf.CF  then HumanoidRootPart.CFrame                  = arraytoCF(kf.CF)                             end
+        if kf.V   then HumanoidRootPart.AssemblyLinearVelocity   = Vector3.new(kf.V[1],  kf.V[2],  kf.V[3])   end
+        if kf.RV  then HumanoidRootPart.AssemblyAngularVelocity  = Vector3.new(kf.RV[1], kf.RV[2], kf.RV[3])  end
+        if kf.CCF then camera.CFrame                             = arraytoCF(kf.CCF)                            end
     end
 
     isRunning = false
 end
 
 local function startRun()
-    if isRunning then return end
-    if #configs == 0 then
-        warn("[TAS] No configs loaded.")
-        return
-    end
-    local cfg = configs[selectedIdx]
+    if isRunning or #configs == 0 then return end
+    local cfg  = configs[selectedIdx]
     local data = loadConfig(cfg)
     if not data then return end
-
-    isRunning = true
-    runThread = task.spawn(function()
+    isRunning  = true
+    runThread  = task.spawn(function()
         playback(data)
         isRunning = false
     end)
@@ -152,159 +123,157 @@ end
 -- GUI
 -- ============================================================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "TAS_GUI"
-ScreenGui.ResetOnSpawn = false
+ScreenGui.Name           = "TAS_GUI"
+ScreenGui.ResetOnSpawn   = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+ScreenGui.Parent         = LocalPlayer:WaitForChild("PlayerGui")
 
--- Main frame
 local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 260, 0, 160)
-MainFrame.Position = UDim2.new(0, 20, 0.5, -80)
+MainFrame.Name             = "MainFrame"
+MainFrame.Size             = UDim2.new(0, 260, 0, 165)
+MainFrame.Position         = UDim2.new(0, 20, 0.5, -82)
 MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
+MainFrame.BorderSizePixel  = 0
+MainFrame.Active           = true
+MainFrame.Draggable        = true
+MainFrame.Parent           = ScreenGui
 
--- Rounded corners
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 8)
-UICorner.Parent = MainFrame
+local function addCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+end
 
--- Stroke
-local UIStroke = Instance.new("UIStroke")
-UIStroke.Color = Color3.fromRGB(80, 80, 120)
-UIStroke.Thickness = 1.5
-UIStroke.Parent = MainFrame
+addCorner(MainFrame)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color     = Color3.fromRGB(80, 80, 130)
+stroke.Thickness = 1.5
+stroke.Parent    = MainFrame
 
 -- Title bar
 local TitleBar = Instance.new("Frame")
-TitleBar.Name = "TitleBar"
-TitleBar.Size = UDim2.new(1, 0, 0, 32)
-TitleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
-TitleBar.BorderSizePixel = 0
-TitleBar.Parent = MainFrame
+TitleBar.Size             = UDim2.new(1, 0, 0, 32)
+TitleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 58)
+TitleBar.BorderSizePixel  = 0
+TitleBar.Parent           = MainFrame
+addCorner(TitleBar)
 
-local TitleCorner = Instance.new("UICorner")
-TitleCorner.CornerRadius = UDim.new(0, 8)
-TitleCorner.Parent = TitleBar
-
--- Fix bottom corners of title bar
 local TitleFix = Instance.new("Frame")
-TitleFix.Size = UDim2.new(1, 0, 0.5, 0)
-TitleFix.Position = UDim2.new(0, 0, 0.5, 0)
-TitleFix.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
-TitleFix.BorderSizePixel = 0
-TitleFix.Parent = TitleBar
+TitleFix.Size             = UDim2.new(1, 0, 0.5, 0)
+TitleFix.Position         = UDim2.new(0, 0, 0.5, 0)
+TitleFix.BackgroundColor3 = Color3.fromRGB(35, 35, 58)
+TitleFix.BorderSizePixel  = 0
+TitleFix.Parent           = TitleBar
 
 local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Text = "⚡ TAS Runner"
-TitleLabel.Size = UDim2.new(1, -10, 1, 0)
-TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+TitleLabel.Text               = "⚡ TAS Runner"
+TitleLabel.Size               = UDim2.new(1, -10, 1, 0)
+TitleLabel.Position           = UDim2.new(0, 10, 0, 0)
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
-TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.TextSize = 13
-TitleLabel.Parent = TitleBar
+TitleLabel.TextColor3         = Color3.fromRGB(200, 200, 255)
+TitleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+TitleLabel.Font               = Enum.Font.GothamBold
+TitleLabel.TextSize           = 13
+TitleLabel.Parent             = TitleBar
 
--- Status label
 local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Name = "Status"
-StatusLabel.Text = "● Idle"
-StatusLabel.Size = UDim2.new(1, -20, 0, 20)
-StatusLabel.Position = UDim2.new(0, 10, 0, 38)
+StatusLabel.Size               = UDim2.new(1, -20, 0, 20)
+StatusLabel.Position           = UDim2.new(0, 10, 0, 38)
 StatusLabel.BackgroundTransparency = 1
-StatusLabel.TextColor3 = Color3.fromRGB(140, 140, 180)
-StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-StatusLabel.Font = Enum.Font.Gotham
-StatusLabel.TextSize = 11
-StatusLabel.Parent = MainFrame
+StatusLabel.TextColor3         = Color3.fromRGB(140, 140, 180)
+StatusLabel.TextXAlignment     = Enum.TextXAlignment.Left
+StatusLabel.Font               = Enum.Font.Gotham
+StatusLabel.TextSize           = 11
+StatusLabel.Text               = "● Scanning TAS_Configs/..."
+StatusLabel.Parent             = MainFrame
 
--- Config label
 local ConfigLabel = Instance.new("TextLabel")
-ConfigLabel.Text = "Config"
-ConfigLabel.Size = UDim2.new(1, -20, 0, 16)
-ConfigLabel.Position = UDim2.new(0, 10, 0, 62)
+ConfigLabel.Text               = "Config"
+ConfigLabel.Size               = UDim2.new(1, -20, 0, 16)
+ConfigLabel.Position           = UDim2.new(0, 10, 0, 62)
 ConfigLabel.BackgroundTransparency = 1
-ConfigLabel.TextColor3 = Color3.fromRGB(160, 160, 200)
-ConfigLabel.TextXAlignment = Enum.TextXAlignment.Left
-ConfigLabel.Font = Enum.Font.Gotham
-ConfigLabel.TextSize = 11
-ConfigLabel.Parent = MainFrame
+ConfigLabel.TextColor3         = Color3.fromRGB(160, 160, 200)
+ConfigLabel.TextXAlignment     = Enum.TextXAlignment.Left
+ConfigLabel.Font               = Enum.Font.Gotham
+ConfigLabel.TextSize           = 11
+ConfigLabel.Parent             = MainFrame
 
--- Dropdown button
 local DropButton = Instance.new("TextButton")
-DropButton.Name = "DropButton"
-DropButton.Size = UDim2.new(1, -20, 0, 30)
-DropButton.Position = UDim2.new(0, 10, 0, 80)
-DropButton.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
-DropButton.BorderSizePixel = 0
-DropButton.Text = "Loading..."
-DropButton.TextColor3 = Color3.fromRGB(220, 220, 255)
-DropButton.Font = Enum.Font.Gotham
-DropButton.TextSize = 12
-DropButton.Parent = MainFrame
-
-local DropCorner = Instance.new("UICorner")
-DropCorner.CornerRadius = UDim.new(0, 6)
-DropCorner.Parent = DropButton
+DropButton.Size             = UDim2.new(1, -20, 0, 30)
+DropButton.Position         = UDim2.new(0, 10, 0, 80)
+DropButton.BackgroundColor3 = Color3.fromRGB(40, 40, 65)
+DropButton.BorderSizePixel  = 0
+DropButton.Text             = "No configs found"
+DropButton.TextColor3       = Color3.fromRGB(220, 220, 255)
+DropButton.Font             = Enum.Font.Gotham
+DropButton.TextSize         = 12
+DropButton.Parent           = MainFrame
+addCorner(DropButton, 6)
 
 local DropArrow = Instance.new("TextLabel")
-DropArrow.Text = "▼"
-DropArrow.Size = UDim2.new(0, 24, 1, 0)
-DropArrow.Position = UDim2.new(1, -28, 0, 0)
+DropArrow.Text               = "▼"
+DropArrow.Size               = UDim2.new(0, 24, 1, 0)
+DropArrow.Position           = UDim2.new(1, -28, 0, 0)
 DropArrow.BackgroundTransparency = 1
-DropArrow.TextColor3 = Color3.fromRGB(150, 150, 200)
-DropArrow.Font = Enum.Font.Gotham
-DropArrow.TextSize = 11
-DropArrow.Parent = DropButton
+DropArrow.TextColor3         = Color3.fromRGB(150, 150, 200)
+DropArrow.Font               = Enum.Font.Gotham
+DropArrow.TextSize           = 11
+DropArrow.Parent             = DropButton
 
--- Dropdown list (hidden by default)
 local DropList = Instance.new("Frame")
-DropList.Name = "DropList"
-DropList.Size = UDim2.new(1, -20, 0, 0)
-DropList.Position = UDim2.new(0, 10, 0, 112)
-DropList.BackgroundColor3 = Color3.fromRGB(30, 30, 50)
-DropList.BorderSizePixel = 0
+DropList.Size             = UDim2.new(1, -20, 0, 0)
+DropList.Position         = UDim2.new(0, 10, 0, 112)
+DropList.BackgroundColor3 = Color3.fromRGB(30, 30, 52)
+DropList.BorderSizePixel  = 0
 DropList.ClipsDescendants = true
-DropList.ZIndex = 10
-DropList.Visible = false
-DropList.Parent = MainFrame
-
-local DropListCorner = Instance.new("UICorner")
-DropListCorner.CornerRadius = UDim.new(0, 6)
-DropListCorner.Parent = DropList
+DropList.ZIndex           = 10
+DropList.Visible          = false
+DropList.Parent           = MainFrame
+addCorner(DropList, 6)
 
 local DropListLayout = Instance.new("UIListLayout")
 DropListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-DropListLayout.Padding = UDim.new(0, 2)
-DropListLayout.Parent = DropList
+DropListLayout.Padding   = UDim.new(0, 2)
+DropListLayout.Parent    = DropList
 
--- Start / Stop button
+local DropPad = Instance.new("UIPadding")
+DropPad.PaddingTop    = UDim.new(0, 2)
+DropPad.PaddingBottom = UDim.new(0, 2)
+DropPad.PaddingLeft   = UDim.new(0, 2)
+DropPad.PaddingRight  = UDim.new(0, 2)
+DropPad.Parent        = DropList
+
+local BASE_HEIGHT = 165
+
+local RefreshButton = Instance.new("TextButton")
+RefreshButton.Size             = UDim2.new(0, 32, 0, 32)
+RefreshButton.Position         = UDim2.new(0, 10, 0, 123)
+RefreshButton.BackgroundColor3 = Color3.fromRGB(50, 50, 82)
+RefreshButton.BorderSizePixel  = 0
+RefreshButton.Text             = "↻"
+RefreshButton.TextColor3       = Color3.fromRGB(200, 200, 255)
+RefreshButton.Font             = Enum.Font.GothamBold
+RefreshButton.TextSize         = 18
+RefreshButton.Parent           = MainFrame
+addCorner(RefreshButton, 6)
+
 local RunButton = Instance.new("TextButton")
-RunButton.Name = "RunButton"
-RunButton.Size = UDim2.new(1, -20, 0, 32)
-RunButton.Position = UDim2.new(0, 10, 0, 118)
+RunButton.Size             = UDim2.new(1, -52, 0, 32)
+RunButton.Position         = UDim2.new(0, 48, 0, 123)
 RunButton.BackgroundColor3 = Color3.fromRGB(60, 180, 100)
-RunButton.BorderSizePixel = 0
-RunButton.Text = "▶  Start"
-RunButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-RunButton.Font = Enum.Font.GothamBold
-RunButton.TextSize = 13
-RunButton.Parent = MainFrame
-
-local RunCorner = Instance.new("UICorner")
-RunCorner.CornerRadius = UDim.new(0, 6)
-RunCorner.Parent = RunButton
+RunButton.BorderSizePixel  = 0
+RunButton.Text             = "▶  Start"
+RunButton.TextColor3       = Color3.fromRGB(255, 255, 255)
+RunButton.Font             = Enum.Font.GothamBold
+RunButton.TextSize         = 13
+RunButton.Parent           = MainFrame
+addCorner(RunButton, 6)
 
 -- ============================================================
--- DROPDOWN LOGIC
+-- DROPDOWN POPULATION
 -- ============================================================
 local function populateDropdown()
-    -- Clear existing items
     for _, child in ipairs(DropList:GetChildren()) do
         if child:IsA("TextButton") then child:Destroy() end
     end
@@ -316,93 +285,101 @@ local function populateDropdown()
 
     for i, cfg in ipairs(configs) do
         local item = Instance.new("TextButton")
-        item.Size = UDim2.new(1, 0, 0, 28)
+        item.Size             = UDim2.new(1, 0, 0, 28)
         item.BackgroundColor3 = Color3.fromRGB(40, 40, 65)
-        item.BorderSizePixel = 0
-        item.Text = " " .. cfg.name
-        item.TextColor3 = Color3.fromRGB(210, 210, 255)
-        item.Font = Enum.Font.Gotham
-        item.TextSize = 12
-        item.TextXAlignment = Enum.TextXAlignment.Left
-        item.LayoutOrder = i
-        item.ZIndex = 11
-        item.Parent = DropList
-
-        local ic = Instance.new("UICorner")
-        ic.CornerRadius = UDim.new(0, 4)
-        ic.Parent = item
+        item.BorderSizePixel  = 0
+        item.Text             = "  " .. cfg.name
+        item.TextColor3       = Color3.fromRGB(210, 210, 255)
+        item.Font             = Enum.Font.Gotham
+        item.TextSize         = 12
+        item.TextXAlignment   = Enum.TextXAlignment.Left
+        item.LayoutOrder      = i
+        item.ZIndex           = 11
+        item.Parent           = DropList
+        addCorner(item, 4)
 
         local idx = i
         item.MouseButton1Click:Connect(function()
-            selectedIdx = idx
-            DropButton.Text = configs[idx].name
-            -- close dropdown
-            dropOpen = false
+            selectedIdx      = idx
+            DropButton.Text  = configs[idx].name
+            dropOpen         = false
             DropList.Visible = false
-            DropArrow.Text = "▼"
+            DropArrow.Text   = "▼"
+            MainFrame.Size         = UDim2.new(0, 260, 0, BASE_HEIGHT)
+            RefreshButton.Position = UDim2.new(0, 10, 0, 123)
+            RunButton.Position     = UDim2.new(0, 48, 0, 123)
         end)
-
-        item.MouseEnter:Connect(function()
-            item.BackgroundColor3 = Color3.fromRGB(60, 60, 90)
-        end)
-        item.MouseLeave:Connect(function()
-            item.BackgroundColor3 = Color3.fromRGB(40, 40, 65)
-        end)
+        item.MouseEnter:Connect(function() item.BackgroundColor3 = Color3.fromRGB(60, 60, 95) end)
+        item.MouseLeave:Connect(function() item.BackgroundColor3 = Color3.fromRGB(40, 40, 65) end)
     end
 
-    -- Resize drop list to fit items
-    local itemH = 28
-    local pad = 4
-    DropList.Size = UDim2.new(1, -20, 0, #configs * (itemH + 2) + pad)
-
-    -- Select first by default
-    selectedIdx = 1
+    DropList.Size   = UDim2.new(1, -20, 0, #configs * 30 + 4)
+    selectedIdx     = 1
     DropButton.Text = configs[1].name
 end
 
-DropButton.MouseButton1Click:Connect(function()
-    if #configs == 0 then return end
-    dropOpen = not dropOpen
-    DropList.Visible = dropOpen
-    DropArrow.Text = dropOpen and "▲" or "▼"
-
-    if dropOpen then
-        -- Push run button down
-        RunButton.Position = UDim2.new(0, 10, 0, 118 + DropList.Size.Y.Offset + 4)
-        MainFrame.Size = UDim2.new(0, 260, 0, 160 + DropList.Size.Y.Offset + 4)
+local function refreshConfigs()
+    scanConfigs()
+    populateDropdown()
+    if #configs == 0 then
+        StatusLabel.Text       = "● Drop .json files into workspace/TAS_Configs/"
+        StatusLabel.TextColor3 = Color3.fromRGB(220, 140, 80)
     else
-        RunButton.Position = UDim2.new(0, 10, 0, 118)
-        MainFrame.Size = UDim2.new(0, 260, 0, 160)
-    end
-end)
-
--- ============================================================
--- RUN / STOP BUTTON LOGIC
--- ============================================================
-local function updateUI()
-    if isRunning then
-        RunButton.Text = "■  Stop"
-        RunButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-        StatusLabel.Text = "● Running: " .. (configs[selectedIdx] and configs[selectedIdx].name or "?")
-        StatusLabel.TextColor3 = Color3.fromRGB(100, 220, 120)
-    else
-        RunButton.Text = "▶  Start"
-        RunButton.BackgroundColor3 = Color3.fromRGB(60, 180, 100)
-        StatusLabel.Text = "● Idle"
+        StatusLabel.Text       = "● Ready  (" .. #configs .. " config" .. (#configs == 1 and "" or "s") .. ")"
         StatusLabel.TextColor3 = Color3.fromRGB(140, 140, 180)
     end
 end
 
-RunButton.MouseButton1Click:Connect(function()
+-- ============================================================
+-- DROPDOWN TOGGLE
+-- ============================================================
+DropButton.MouseButton1Click:Connect(function()
+    if #configs == 0 then return end
+    dropOpen         = not dropOpen
+    DropList.Visible = dropOpen
+    DropArrow.Text   = dropOpen and "▲" or "▼"
+
+    local extra = dropOpen and (DropList.Size.Y.Offset + 4) or 0
+    MainFrame.Size         = UDim2.new(0, 260, 0, BASE_HEIGHT + extra)
+    RefreshButton.Position = UDim2.new(0, 10, 0, 123 + extra)
+    RunButton.Position     = UDim2.new(0, 48, 0, 123 + extra)
+end)
+
+-- ============================================================
+-- REFRESH BUTTON
+-- ============================================================
+RefreshButton.MouseButton1Click:Connect(function()
+    dropOpen         = false
+    DropList.Visible = false
+    DropArrow.Text   = "▼"
+    MainFrame.Size         = UDim2.new(0, 260, 0, BASE_HEIGHT)
+    RefreshButton.Position = UDim2.new(0, 10, 0, 123)
+    RunButton.Position     = UDim2.new(0, 48, 0, 123)
+    StatusLabel.Text       = "● Refreshing..."
+    task.wait(0.05)
+    refreshConfigs()
+end)
+
+-- ============================================================
+-- START / STOP
+-- ============================================================
+local function updateUI()
     if isRunning then
-        stopRun()
+        RunButton.Text             = "■  Stop"
+        RunButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+        StatusLabel.Text           = "● Running: " .. (configs[selectedIdx] and configs[selectedIdx].name or "?")
+        StatusLabel.TextColor3     = Color3.fromRGB(100, 220, 120)
     else
-        startRun()
+        RunButton.Text             = "▶  Start"
+        RunButton.BackgroundColor3 = Color3.fromRGB(60, 180, 100)
     end
+end
+
+RunButton.MouseButton1Click:Connect(function()
+    if isRunning then stopRun() else startRun() end
     updateUI()
 end)
 
--- Poll running state to keep button in sync
 task.spawn(function()
     while true do
         task.wait(0.25)
@@ -411,18 +388,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- INIT: Fetch configs on load
+-- INIT
 -- ============================================================
-task.spawn(function()
-    StatusLabel.Text = "● Fetching configs..."
-    fetchConfigs()
-    populateDropdown()
-    updateUI()
-    if #configs == 0 then
-        StatusLabel.Text = "● No configs found"
-    else
-        StatusLabel.Text = "● Ready  (" .. #configs .. " config" .. (#configs == 1 and "" or "s") .. ")"
-    end
-end)
-
-print("[TAS] GUI loaded successfully.")
+refreshConfigs()
+print("[TAS] GUI ready. Folder: workspace/" .. FOLDER .. "/")
