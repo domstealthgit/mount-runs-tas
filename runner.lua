@@ -15,7 +15,9 @@ local Humanoid = Character:WaitForChild("Humanoid")
 -- ============================================================
 -- CONFIG
 -- ============================================================
-local REPO_API     = "https://api.github.com/repos/domstealthgit/mount-runs-tas/contents/"
+-- Index file in your repo: a JSON array of config names (without .json extension)
+-- e.g. ["skytopiabest1", "skytopiabest2"]
+local CONFIG_INDEX = "https://raw.githubusercontent.com/domstealthgit/mount-runs-tas/refs/heads/main/configs.json"
 local RAW_BASE     = "https://raw.githubusercontent.com/domstealthgit/mount-runs-tas/refs/heads/main/"
 
 -- ============================================================
@@ -39,22 +41,19 @@ end
 
 local function fetchConfigs()
     local ok, result = pcall(function()
-        return HttpService:GetAsync(REPO_API)
+        return HttpService:GetAsync(CONFIG_INDEX)
     end)
     if not ok then
-        warn("[TAS] Could not fetch config list: " .. tostring(result))
+        warn("[TAS] Could not fetch configs.json: " .. tostring(result))
         return
     end
-    local data = HttpService:JSONDecode(result)
+    local names = HttpService:JSONDecode(result)
     configs = {}
-    for _, entry in ipairs(data) do
-        if entry.type == "file" and entry.name:match("%.json$") then
-            local displayName = entry.name:gsub("%.json$", "")
-            table.insert(configs, {
-                name = displayName,
-                url  = RAW_BASE .. entry.name
-            })
-        end
+    for _, name in ipairs(names) do
+        table.insert(configs, {
+            name = name,
+            url  = RAW_BASE .. name .. ".json"
+        })
     end
 end
 
