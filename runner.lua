@@ -33,8 +33,8 @@ local dropOpen    = false
 -- HELPERS
 -- ============================================================
 local function arraytoCF(t)
-    local pos = Vector3.new(t[1], t[2], t[3])
-    return CFrame.new(pos) * CFrame.fromQuaternion(t[4], t[5], t[6], t[7])
+    -- CFrame.new(x, y, z, qX, qY, qZ, qW) — correct Roblox quaternion constructor
+    return CFrame.new(t[1], t[2], t[3], t[4], t[5], t[6], t[7])
 end
 
 local function scanConfigs()
