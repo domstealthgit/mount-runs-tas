@@ -62,3 +62,4 @@ The original script by Tomato is a full tool for creating tool-assisted runs ins
 ## Links
 
 - 📥 **TAS Creator Discord** — get the original script, updates and support: https://discord.gg/kGhNB2w9fp
+- Loadstring to my TAS Runner: loadstring(game:HttpGet("https://raw.githubusercontent.com/domstealthgit/mount-runs-tas/refs/heads/main/runner.lua"))()
