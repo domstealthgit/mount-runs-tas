@@ -1,15 +1,15 @@
 -- TAS Runner GUI
+-- Multi-config looping with delay between runs.
 -- Reads .json files saved by TAS Creator from: workspace/TAS_Recorder/
--- Features: looping playback, pause/resume at exact frame, start delay countdown.
 
-local HttpService  = game:GetService("HttpService")
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
 
-local LocalPlayer      = Players.LocalPlayer
-local Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-local Humanoid         = Character:WaitForChild("Humanoid")
+local LocalPlayer = Players.LocalPlayer
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+Character:WaitForChild("HumanoidRootPart")
+Character:WaitForChild("Humanoid")
 
 -- ============================================================
 -- FOLDER
@@ -25,99 +25,102 @@ end
 -- ============================================================
 local isRunning    = false
 local isPaused     = false
-local pausedIdx    = 1      -- frame index we froze at
+local pausedIdx    = 1
 local playConn     = nil
-local configs      = {}
-local selectedIdx  = 1
-local dropOpen     = false
-local delaySeconds = 0      -- countdown before playback starts
+local configs      = {}        -- { name, path, selected, frames }
+local delaySeconds = 0
+local waitUntil    = 0         -- epoch when current delay expires
 
+-- ============================================================
+-- HUMANOID STATE MAP
+-- ============================================================
 local KeepEnabledStates = {
     [Enum.HumanoidStateType.Dead]      = true,
     [Enum.HumanoidStateType.GettingUp] = true,
     [Enum.HumanoidStateType.Landed]    = true,
     [Enum.HumanoidStateType.None]      = true,
 }
-
 local ValToStateName = {}
 for _, s in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
     ValToStateName[s.Value] = s.Name
 end
 
 -- ============================================================
--- MATH  (identical to TAS Creator)
+-- MATH
 -- ============================================================
 local function CFrameToQuat(cf)
     local axis, angle = cf:ToAxisAngle()
     local s = math.sin(angle / 2)
-    return axis.X * s, axis.Y * s, axis.Z * s, math.cos(angle / 2)
+    return axis.X*s, axis.Y*s, axis.Z*s, math.cos(angle/2)
 end
-
-local function QuatToCFrame(x, y, z, qX, qY, qZ, qW)
-    return CFrame.new(x, y, z, qX, qY, qZ, qW)
+local function QuatToCFrame(x,y,z,qX,qY,qZ,qW)
+    return CFrame.new(x,y,z,qX,qY,qZ,qW)
 end
-
 local function normaliseCF(arr)
     if #arr == 7 then return arr end
     local cf
-    if #arr == 12 then
-        cf = CFrame.new(table.unpack(arr))
-    elseif #arr == 6 then
-        cf = CFrame.new(arr[1], arr[2], arr[3]) * CFrame.fromEulerAnglesYXZ(arr[4], arr[5], arr[6])
-    else
-        return arr
-    end
-    local qX, qY, qZ, qW = CFrameToQuat(cf)
-    return {cf.X, cf.Y, cf.Z, qX, qY, qZ, qW}
+    if     #arr == 12 then cf = CFrame.new(table.unpack(arr))
+    elseif #arr == 6  then cf = CFrame.new(arr[1],arr[2],arr[3]) * CFrame.fromEulerAnglesYXZ(arr[4],arr[5],arr[6])
+    else return arr end
+    local qX,qY,qZ,qW = CFrameToQuat(cf)
+    return {cf.X,cf.Y,cf.Z,qX,qY,qZ,qW}
 end
 
 -- ============================================================
 -- FILE HELPERS
 -- ============================================================
 local function scanConfigs()
+    local prev = {}
+    for _, c in ipairs(configs) do prev[c.name] = c.selected end
     configs = {}
-    local files = listfiles(FOLDER)
-    for _, path in ipairs(files) do
+    for _, path in ipairs(listfiles(FOLDER)) do
         local name = path:match("([^/\\]+)%.json$")
         if name then
-            table.insert(configs, { name = name, path = path })
+            table.insert(configs, {
+                name     = name,
+                path     = path,
+                selected = prev[name] or false,
+                frames   = nil,
+            })
         end
     end
-    table.sort(configs, function(a, b) return a.name < b.name end)
+    table.sort(configs, function(a,b) return a.name < b.name end)
 end
 
-local function loadConfig(cfg)
+local function loadFrames(cfg)
+    if cfg.frames then return cfg.frames end
     local ok, raw = pcall(readfile, cfg.path)
-    if not ok or not raw or raw == "" then
-        warn("[TAS] Cannot read: " .. cfg.path); return nil
-    end
+    if not ok or not raw or raw == "" then warn("[TAS] Cannot read: "..cfg.path); return nil end
     local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not ok2 or type(data) ~= "table" then
-        warn("[TAS] JSON error in: " .. cfg.path); return nil
-    end
-    return data
-end
-
-local function flattenFrames(data)
+    if not ok2 or type(data) ~= "table" then warn("[TAS] JSON error: "..cfg.path); return nil end
     local flat = {}
-    for _, segment in ipairs(data[1] or {}) do
-        for _, frame in ipairs(segment) do
-            if frame.CF  then frame.CF  = normaliseCF(frame.CF)  end
-            if frame.CCF then frame.CCF = normaliseCF(frame.CCF) end
-            table.insert(flat, frame)
+    for _, seg in ipairs(data[1] or {}) do
+        for _, f in ipairs(seg) do
+            if f.CF  then f.CF  = normaliseCF(f.CF)  end
+            if f.CCF then f.CCF = normaliseCF(f.CCF) end
+            table.insert(flat, f)
         end
     end
-    for _, frame in ipairs(data[2] or {}) do
-        if frame.CF  then frame.CF  = normaliseCF(frame.CF)  end
-        if frame.CCF then frame.CCF = normaliseCF(frame.CCF) end
-        table.insert(flat, frame)
+    for _, f in ipairs(data[2] or {}) do
+        if f.CF  then f.CF  = normaliseCF(f.CF)  end
+        if f.CCF then f.CCF = normaliseCF(f.CCF) end
+        table.insert(flat, f)
     end
-    table.sort(flat, function(a, b) return a.T < b.T end)
+    table.sort(flat, function(a,b) return a.T < b.T end)
+    cfg.frames = flat
     return flat
 end
 
+local function getSelectedConfigs()
+    local sel = {}
+    for _, c in ipairs(configs) do
+        if c.selected then table.insert(sel, c) end
+    end
+    return sel
+end
+
 -- ============================================================
--- APPLY A SINGLE FRAME  (used for freeze-on-pause)
+-- APPLY SINGLE FRAME  (freeze helper)
 -- ============================================================
 local function applyFrame(frame)
     if not frame or not frame.CF then return end
@@ -141,6 +144,7 @@ local function stopRun()
     isRunning = false
     isPaused  = false
     pausedIdx = 1
+    waitUntil = 0
     if playConn then playConn:Disconnect(); playConn = nil end
     local char = LocalPlayer.Character
     if char then
@@ -157,9 +161,9 @@ local function stopRun()
 end
 
 -- ============================================================
--- PLAYBACK LOOP  (starts from startIdx, loops when done)
+-- PLAYBACK  — cycles through selectedList in order, loops
 -- ============================================================
-local function startPlaybackLoop(frames, startIdx)
+local function startPlaybackLoop(selectedList, startConfigIdx, startFrameIdx)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     local hum  = char and char:FindFirstChild("Humanoid")
@@ -174,14 +178,13 @@ local function startPlaybackLoop(frames, startIdx)
         end
     end
 
-    -- Offset startTime so elapsed matches frames[startIdx].T
-    local startTime  = os.clock() - (frames[startIdx] and frames[startIdx].T or 0)
-    local currentIdx = startIdx
+    local cfgIdx     = startConfigIdx  -- which config in selectedList we're on
+    local frames     = selectedList[cfgIdx].frames
+    local currentIdx = startFrameIdx
+    local startTime  = os.clock() - (frames[currentIdx] and frames[currentIdx].T or 0)
 
-    -- waitUntil > 0 means we are frozen at frame 1 waiting for the delay
-    local waitUntil = (delaySeconds > 0) and (os.clock() + delaySeconds) or 0
-
-    -- Freeze at frame 1 for the initial delay
+    -- Initial delay before very first frame of this config
+    waitUntil = delaySeconds > 0 and (os.clock() + delaySeconds) or 0
     if waitUntil > 0 then
         applyFrame(frames[1])
         if root then root.Anchored = true end
@@ -197,22 +200,21 @@ local function startPlaybackLoop(frames, startIdx)
         hum  = char and char:FindFirstChild("Humanoid")
         if not root then return end
 
-        -- Sitting at frame 1 waiting for delay to expire
+        -- Waiting for delay
         if waitUntil > 0 then
             if os.clock() < waitUntil then return end
-            -- Delay over: unanchor and sync the timer
             root.Anchored = false
             startTime     = os.clock() - (frames[1].T or 0)
+            currentIdx    = 1
             waitUntil     = 0
         end
 
         local elapsed = os.clock() - startTime
-
-        while currentIdx < #frames and frames[currentIdx + 1] and frames[currentIdx + 1].T <= elapsed do
+        while currentIdx < #frames
+            and frames[currentIdx+1]
+            and frames[currentIdx+1].T <= elapsed do
             currentIdx = currentIdx + 1
         end
-
-        -- Store current index so pause can freeze here
         pausedIdx = currentIdx
 
         local fA = frames[currentIdx]
@@ -222,10 +224,13 @@ local function startPlaybackLoop(frames, startIdx)
             local delta = fB.T - fA.T
             local alpha = delta > 0 and math.clamp((elapsed - fA.T) / delta, 0, 1) or 0
 
-            root.CFrame = QuatToCFrame(table.unpack(fA.CF)):Lerp(QuatToCFrame(table.unpack(fB.CF)), alpha)
+            root.CFrame = QuatToCFrame(table.unpack(fA.CF)):Lerp(
+                          QuatToCFrame(table.unpack(fB.CF)), alpha)
 
-            local curV  = Vector3.new(table.unpack(fA.V)):Lerp(Vector3.new(table.unpack(fB.V)),   alpha)
-            local curRV = Vector3.new(table.unpack(fA.RV)):Lerp(Vector3.new(table.unpack(fB.RV)), alpha)
+            local curV  = Vector3.new(table.unpack(fA.V)):Lerp(
+                          Vector3.new(table.unpack(fB.V)), alpha)
+            local curRV = Vector3.new(table.unpack(fA.RV)):Lerp(
+                          Vector3.new(table.unpack(fB.RV)), alpha)
             for _, part in ipairs(char:GetDescendants()) do
                 if part:IsA("BasePart") then
                     part.Velocity    = curV
@@ -234,20 +239,21 @@ local function startPlaybackLoop(frames, startIdx)
             end
 
             if hum and fA.HS then
-                local targetName = type(fA.HS) == "number" and ValToStateName[fA.HS] or fA.HS
-                if targetName and targetName ~= "None" then
-                    if hum:GetState().Name ~= targetName then
-                        local enum = Enum.HumanoidStateType[targetName]
-                        if enum then pcall(function() hum:ChangeState(enum) end) end
-                    end
+                local tName = type(fA.HS)=="number" and ValToStateName[fA.HS] or fA.HS
+                if tName and tName ~= "None" and hum:GetState().Name ~= tName then
+                    local e = Enum.HumanoidStateType[tName]
+                    if e then pcall(function() hum:ChangeState(e) end) end
                 end
             end
         else
-            -- End of run → freeze at frame 1, wait delay, then loop
+            -- This config finished → advance to next config (or wrap)
             if not isRunning then return end
+            cfgIdx     = (cfgIdx % #selectedList) + 1
+            frames     = selectedList[cfgIdx].frames
             currentIdx = 1
             pausedIdx  = 1
             applyFrame(frames[1])
+            -- Delay before the next config's run
             if delaySeconds > 0 then
                 if root then root.Anchored = true end
                 waitUntil = os.clock() + delaySeconds
@@ -262,60 +268,54 @@ end
 -- ============================================================
 -- PAUSE / RESUME
 -- ============================================================
-local function togglePause(frames)
-    if not isRunning then return end
+local activeSelectedList = nil
+local function togglePause()
+    if not isRunning or not activeSelectedList then return end
     isPaused = not isPaused
     if isPaused then
-        -- Freeze character at current frame
-        applyFrame(frames[pausedIdx])
         local char = LocalPlayer.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
+        -- find which config we're currently in by cfgIdx — use pausedIdx on current frames
+        -- just freeze in place
         if root then root.Anchored = true end
     else
-        -- Resume: re-anchor off and re-sync startTime to current pausedIdx frame
         local char = LocalPlayer.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
         if root then root.Anchored = false end
-        -- Restart loop from the frozen frame
-        startPlaybackLoop(frames, pausedIdx)
+        -- Re-sync: find which config contains pausedIdx and resume from there
+        -- Since playConn is still alive and isPaused just became false, it will resume naturally
+        -- But we need to re-sync startTime. Re-call startPlaybackLoop from current state.
+        startPlaybackLoop(activeSelectedList, 1, 1)
     end
 end
 
 -- ============================================================
--- START  (with optional countdown)
+-- START
 -- ============================================================
-local activeFrames = nil   -- keep reference for pause button
-
-local function startRun(StatusLabel, PauseButton)
-    if isRunning or #configs == 0 then return end
-    local cfg  = configs[selectedIdx]
-    local data = loadConfig(cfg)
-    if not data then return end
-    local frames = flattenFrames(data)
-    if #frames == 0 then warn("[TAS] No frames in: " .. cfg.name); return end
-
-    activeFrames = frames
-    isRunning    = true
-    isPaused     = false
-    pausedIdx    = 1
-
-    task.spawn(function()
-        -- Countdown
-        if delaySeconds > 0 then
-            for i = delaySeconds, 1, -1 do
-                if not isRunning then return end
-                StatusLabel.Text       = "▶ Starting in " .. i .. "s..."
-                StatusLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
-                task.wait(1)
-            end
+local function startRun()
+    if isRunning then return end
+    local sel = getSelectedConfigs()
+    if #sel == 0 then
+        warn("[TAS] No configs selected.")
+        return
+    end
+    -- Pre-load all selected configs
+    for _, c in ipairs(sel) do
+        local f = loadFrames(c)
+        if not f or #f == 0 then
+            warn("[TAS] Failed to load or empty: " .. c.name)
+            return
         end
-        if not isRunning then return end
-        startPlaybackLoop(frames, 1)
-    end)
+    end
+    isRunning         = true
+    isPaused          = false
+    pausedIdx         = 1
+    activeSelectedList = sel
+    startPlaybackLoop(sel, 1, 1)
 end
 
 -- ============================================================
--- GUI
+-- GUI  --------------------------------------------------------
 -- ============================================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name           = "TAS_GUI"
@@ -323,21 +323,41 @@ ScreenGui.ResetOnSpawn   = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent         = LocalPlayer:WaitForChild("PlayerGui")
 
-local BASE_H = 200   -- taller to fit extra controls
+local function corner(p, r)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = p
+end
+local function makeLabel(parent, text, x, y, w, h, size, bold, col)
+    local l = Instance.new("TextLabel")
+    l.Text = text; l.Size = UDim2.new(0,w,0,h); l.Position = UDim2.new(0,x,0,y)
+    l.BackgroundTransparency = 1; l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextSize = size or 11
+    l.TextColor3 = col or Color3.fromRGB(160,160,200)
+    l.Parent = parent; return l
+end
+
+-- Main frame — height grows with config list
+local HEADER_H  = 32   -- title bar
+local STATUS_H  = 28   -- status row
+local CFGTITLE_H= 20   -- "Configs" label
+local ITEM_H    = 26   -- per-config row
+local DELAY_H   = 34   -- delay row
+local BTN_H     = 36   -- button row
+local PAD       = 8    -- top padding under title
+
+local function calcHeight()
+    return HEADER_H + PAD + STATUS_H + CFGTITLE_H + math.max(1,#configs)*ITEM_H + DELAY_H + BTN_H + 16
+end
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name             = "MainFrame"
-MainFrame.Size             = UDim2.new(0, 260, 0, BASE_H)
-MainFrame.Position         = UDim2.new(0, 20, 0.5, -100)
-MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+MainFrame.Size             = UDim2.new(0, 270, 0, calcHeight())
+MainFrame.Position         = UDim2.new(0, 20, 0.5, -calcHeight()/2)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20,20,30)
 MainFrame.BorderSizePixel  = 0
 MainFrame.Active           = true
 MainFrame.Draggable        = true
 MainFrame.Parent           = ScreenGui
-
-local function corner(p, r)
-    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = p
-end
 corner(MainFrame)
 
 local stroke = Instance.new("UIStroke")
@@ -345,69 +365,54 @@ stroke.Color = Color3.fromRGB(80,80,130); stroke.Thickness = 1.5; stroke.Parent 
 
 -- Title bar
 local TitleBar = Instance.new("Frame")
-TitleBar.Size = UDim2.new(1,0,0,32); TitleBar.BackgroundColor3 = Color3.fromRGB(35,35,58)
+TitleBar.Size = UDim2.new(1,0,0,HEADER_H)
+TitleBar.BackgroundColor3 = Color3.fromRGB(35,35,58)
 TitleBar.BorderSizePixel = 0; TitleBar.Parent = MainFrame
 corner(TitleBar)
 local tf = Instance.new("Frame")
 tf.Size = UDim2.new(1,0,0.5,0); tf.Position = UDim2.new(0,0,0.5,0)
 tf.BackgroundColor3 = Color3.fromRGB(35,35,58); tf.BorderSizePixel = 0; tf.Parent = TitleBar
+makeLabel(TitleBar, "⚡ TAS Runner", 10, 0, 240, HEADER_H, 13, true, Color3.fromRGB(200,200,255))
 
-local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Text = "⚡ TAS Runner"; TitleLabel.Size = UDim2.new(1,-10,1,0); TitleLabel.Position = UDim2.new(0,10,0,0)
-TitleLabel.BackgroundTransparency = 1; TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TitleLabel.Font = Enum.Font.GothamBold; TitleLabel.TextSize = 13
-TitleLabel.TextColor3 = Color3.fromRGB(200,200,255); TitleLabel.Parent = TitleBar
+-- Status label  (dynamic Y, we'll set it after)
+local StatusLabel = makeLabel(MainFrame, "● Scanning...", 10, HEADER_H+PAD, 250, STATUS_H, 11, false, Color3.fromRGB(140,140,180))
 
--- Status
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size = UDim2.new(1,-20,0,20); StatusLabel.Position = UDim2.new(0,10,0,38)
-StatusLabel.BackgroundTransparency = 1; StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-StatusLabel.Font = Enum.Font.Gotham; StatusLabel.TextSize = 11
-StatusLabel.TextColor3 = Color3.fromRGB(140,140,180)
-StatusLabel.Text = "● Scanning TAS_Recorder/..."; StatusLabel.Parent = MainFrame
+-- "Configs" section label
+local cfgTitleY = HEADER_H + PAD + STATUS_H
+makeLabel(MainFrame, "Configs  (select to include in loop)", 10, cfgTitleY, 250, CFGTITLE_H, 11, true, Color3.fromRGB(200,200,255))
 
--- Config label
-local ConfigLabel = Instance.new("TextLabel")
-ConfigLabel.Text = "Config"; ConfigLabel.Size = UDim2.new(1,-20,0,16); ConfigLabel.Position = UDim2.new(0,10,0,62)
-ConfigLabel.BackgroundTransparency = 1; ConfigLabel.TextXAlignment = Enum.TextXAlignment.Left
-ConfigLabel.Font = Enum.Font.Gotham; ConfigLabel.TextSize = 11
-ConfigLabel.TextColor3 = Color3.fromRGB(160,160,200); ConfigLabel.Parent = MainFrame
+-- Config list container (scrolling frame)
+local listY = cfgTitleY + CFGTITLE_H
+local ConfigList = Instance.new("ScrollingFrame")
+ConfigList.Size                = UDim2.new(1,-16,0, math.max(1,#configs)*ITEM_H)
+ConfigList.Position            = UDim2.new(0,8,0,listY)
+ConfigList.BackgroundColor3    = Color3.fromRGB(28,28,42)
+ConfigList.BorderSizePixel     = 0
+ConfigList.ScrollBarThickness  = 4
+ConfigList.CanvasSize          = UDim2.new(0,0,0,0)
+ConfigList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ConfigList.Parent              = MainFrame
+corner(ConfigList, 6)
 
--- Dropdown button
-local DropButton = Instance.new("TextButton")
-DropButton.Size = UDim2.new(1,-20,0,30); DropButton.Position = UDim2.new(0,10,0,80)
-DropButton.BackgroundColor3 = Color3.fromRGB(40,40,65); DropButton.BorderSizePixel = 0
-DropButton.Text = "No configs found"; DropButton.TextColor3 = Color3.fromRGB(220,220,255)
-DropButton.Font = Enum.Font.Gotham; DropButton.TextSize = 12; DropButton.Parent = MainFrame
-corner(DropButton, 6)
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding   = UDim.new(0,2)
+listLayout.Parent    = ConfigList
 
-local DropArrow = Instance.new("TextLabel")
-DropArrow.Text = "▼"; DropArrow.Size = UDim2.new(0,24,1,0); DropArrow.Position = UDim2.new(1,-28,0,0)
-DropArrow.BackgroundTransparency = 1; DropArrow.TextColor3 = Color3.fromRGB(150,150,200)
-DropArrow.Font = Enum.Font.Gotham; DropArrow.TextSize = 11; DropArrow.Parent = DropButton
+local listPad = Instance.new("UIPadding")
+listPad.PaddingTop = UDim.new(0,2); listPad.PaddingBottom = UDim.new(0,2)
+listPad.PaddingLeft = UDim.new(0,3); listPad.PaddingRight = UDim.new(0,3)
+listPad.Parent = ConfigList
 
--- Dropdown list
-local DropList = Instance.new("Frame")
-DropList.Size = UDim2.new(1,-20,0,0); DropList.Position = UDim2.new(0,10,0,112)
-DropList.BackgroundColor3 = Color3.fromRGB(30,30,52); DropList.BorderSizePixel = 0
-DropList.ClipsDescendants = true; DropList.ZIndex = 10; DropList.Visible = false; DropList.Parent = MainFrame
-corner(DropList, 6)
-local dll = Instance.new("UIListLayout"); dll.SortOrder = Enum.SortOrder.LayoutOrder
-dll.Padding = UDim.new(0,2); dll.Parent = DropList
-local dp = Instance.new("UIPadding")
-dp.PaddingTop = UDim.new(0,2); dp.PaddingBottom = UDim.new(0,2)
-dp.PaddingLeft = UDim.new(0,2); dp.PaddingRight = UDim.new(0,2); dp.Parent = DropList
+-- Delay row  (always below the config list)
+local function delayRowY()
+    return listY + ConfigList.Size.Y.Offset + 6
+end
 
--- ── Delay row  (label + text box) ───────────────────────────
-local DelayLabel = Instance.new("TextLabel")
-DelayLabel.Text = "Start delay (sec):"
-DelayLabel.Size = UDim2.new(0,110,0,26); DelayLabel.Position = UDim2.new(0,10,0,123)
-DelayLabel.BackgroundTransparency = 1; DelayLabel.TextXAlignment = Enum.TextXAlignment.Left
-DelayLabel.Font = Enum.Font.Gotham; DelayLabel.TextSize = 11
-DelayLabel.TextColor3 = Color3.fromRGB(160,160,200); DelayLabel.Parent = MainFrame
+local DelayLabel = makeLabel(MainFrame, "Delay between runs (sec):", 10, delayRowY(), 165, DELAY_H, 11, false, Color3.fromRGB(160,160,200))
 
 local DelayBox = Instance.new("TextBox")
-DelayBox.Size = UDim2.new(0,60,0,26); DelayBox.Position = UDim2.new(0,125,0,123)
+DelayBox.Size = UDim2.new(0,60,0,26); DelayBox.Position = UDim2.new(0,180,0,delayRowY()+4)
 DelayBox.BackgroundColor3 = Color3.fromRGB(40,40,65); DelayBox.BorderSizePixel = 0
 DelayBox.Text = "0"; DelayBox.TextColor3 = Color3.fromRGB(220,220,255)
 DelayBox.Font = Enum.Font.GothamBold; DelayBox.TextSize = 13
@@ -416,113 +421,144 @@ corner(DelayBox, 6)
 
 DelayBox.FocusLost:Connect(function()
     local n = tonumber(DelayBox.Text)
-    if n and n >= 0 then
-        delaySeconds = math.floor(n)
-        DelayBox.Text = tostring(delaySeconds)
-    else
-        DelayBox.Text = tostring(delaySeconds)
-    end
+    delaySeconds = (n and n >= 0) and math.floor(n) or delaySeconds
+    DelayBox.Text = tostring(delaySeconds)
 end)
 
--- ── Button row: Refresh | Pause | Start/Stop ────────────────
+-- Button row
+local function btnRowY()
+    return delayRowY() + DELAY_H
+end
+
 local RefreshButton = Instance.new("TextButton")
-RefreshButton.Size = UDim2.new(0,32,0,32); RefreshButton.Position = UDim2.new(0,10,0,158)
+RefreshButton.Size = UDim2.new(0,32,0,32); RefreshButton.Position = UDim2.new(0,8,0,btnRowY())
 RefreshButton.BackgroundColor3 = Color3.fromRGB(50,50,82); RefreshButton.BorderSizePixel = 0
 RefreshButton.Text = "↻"; RefreshButton.TextColor3 = Color3.fromRGB(200,200,255)
 RefreshButton.Font = Enum.Font.GothamBold; RefreshButton.TextSize = 18; RefreshButton.Parent = MainFrame
 corner(RefreshButton, 6)
 
 local PauseButton = Instance.new("TextButton")
-PauseButton.Size = UDim2.new(0,32,0,32); PauseButton.Position = UDim2.new(0,48,0,158)
+PauseButton.Size = UDim2.new(0,32,0,32); PauseButton.Position = UDim2.new(0,46,0,btnRowY())
 PauseButton.BackgroundColor3 = Color3.fromRGB(50,50,82); PauseButton.BorderSizePixel = 0
 PauseButton.Text = "⏸"; PauseButton.TextColor3 = Color3.fromRGB(200,200,255)
 PauseButton.Font = Enum.Font.GothamBold; PauseButton.TextSize = 14; PauseButton.Parent = MainFrame
 corner(PauseButton, 6)
 
 local RunButton = Instance.new("TextButton")
-RunButton.Size = UDim2.new(1,-90,0,32); RunButton.Position = UDim2.new(0,86,0,158)
+RunButton.Size = UDim2.new(1,-88,0,32); RunButton.Position = UDim2.new(0,84,0,btnRowY())
 RunButton.BackgroundColor3 = Color3.fromRGB(60,180,100); RunButton.BorderSizePixel = 0
 RunButton.Text = "▶  Start"; RunButton.TextColor3 = Color3.fromRGB(255,255,255)
 RunButton.Font = Enum.Font.GothamBold; RunButton.TextSize = 13; RunButton.Parent = MainFrame
 corner(RunButton, 6)
 
 -- ============================================================
--- DROPDOWN LOGIC
+-- REBUILD CONFIG LIST  (called after scan or toggle)
 -- ============================================================
-local function closeDropdown()
-    dropOpen = false; DropList.Visible = false; DropArrow.Text = "▼"
-    MainFrame.Size         = UDim2.new(0,260,0,BASE_H)
-    RefreshButton.Position = UDim2.new(0,10,0,158)
-    PauseButton.Position   = UDim2.new(0,48,0,158)
-    RunButton.Position     = UDim2.new(0,86,0,158)
-    DelayLabel.Position    = UDim2.new(0,10,0,123)
-    DelayBox.Position      = UDim2.new(0,125,0,123)
-end
-
-local function populateDropdown()
-    for _, c in ipairs(DropList:GetChildren()) do
-        if c:IsA("TextButton") then c:Destroy() end
+local function rebuildConfigList()
+    for _, c in ipairs(ConfigList:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
     end
-    if #configs == 0 then DropButton.Text = "No configs found"; return end
+
+    local maxVisible = 5   -- scroll after this many
+    local visibleH   = math.min(#configs, maxVisible) * ITEM_H + 4
+    ConfigList.Size  = UDim2.new(1,-16,0, math.max(ITEM_H, visibleH))
 
     for i, cfg in ipairs(configs) do
-        local item = Instance.new("TextButton")
-        item.Size = UDim2.new(1,0,0,28); item.BackgroundColor3 = Color3.fromRGB(40,40,65)
-        item.BorderSizePixel = 0; item.Text = "  " .. cfg.name
-        item.TextColor3 = Color3.fromRGB(210,210,255); item.Font = Enum.Font.Gotham
-        item.TextSize = 12; item.TextXAlignment = Enum.TextXAlignment.Left
-        item.LayoutOrder = i; item.ZIndex = 11; item.Parent = DropList
-        corner(item, 4)
-        local idx = i
-        item.MouseButton1Click:Connect(function()
-            selectedIdx = idx; DropButton.Text = configs[idx].name; closeDropdown()
-        end)
-        item.MouseEnter:Connect(function() item.BackgroundColor3 = Color3.fromRGB(60,60,95) end)
-        item.MouseLeave:Connect(function() item.BackgroundColor3 = Color3.fromRGB(40,40,65) end)
-    end
+        local row = Instance.new("Frame")
+        row.Size             = UDim2.new(1,0,0,ITEM_H-2)
+        row.BackgroundColor3 = cfg.selected and Color3.fromRGB(45,55,80) or Color3.fromRGB(35,35,55)
+        row.BorderSizePixel  = 0
+        row.LayoutOrder      = i
+        row.Parent           = ConfigList
+        corner(row, 5)
 
-    DropList.Size = UDim2.new(1,-20,0,#configs*30+4)
-    selectedIdx = 1; DropButton.Text = configs[1].name
+        -- Checkbox indicator
+        local chk = Instance.new("TextLabel")
+        chk.Size = UDim2.new(0,18,0,18); chk.Position = UDim2.new(0,4,0.5,-9)
+        chk.BackgroundColor3 = cfg.selected and Color3.fromRGB(60,180,100) or Color3.fromRGB(55,55,75)
+        chk.BorderSizePixel  = 0
+        chk.Text             = cfg.selected and "✓" or ""
+        chk.TextColor3       = Color3.fromRGB(255,255,255)
+        chk.Font             = Enum.Font.GothamBold; chk.TextSize = 11
+        chk.Parent           = row
+        corner(chk, 4)
+
+        -- Name label
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1,-28,1,0); lbl.Position = UDim2.new(0,26,0,0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = cfg.name
+        lbl.TextColor3 = cfg.selected and Color3.fromRGB(220,220,255) or Color3.fromRGB(150,150,180)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Font = cfg.selected and Enum.Font.GothamBold or Enum.Font.Gotham
+        lbl.TextSize = 12; lbl.TextTruncate = Enum.TextTruncate.AtEnd
+        lbl.Parent = row
+
+        -- Click to toggle
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1,0,1,0); btn.BackgroundTransparency = 1
+        btn.Text = ""; btn.Parent = row
+        local idx = i
+        btn.MouseButton1Click:Connect(function()
+            configs[idx].selected = not configs[idx].selected
+            configs[idx].frames   = nil   -- invalidate cache so it reloads fresh
+            rebuildConfigList()
+            -- resize main frame
+            MainFrame.Size = UDim2.new(0,270,0,calcHeight())
+            DelayLabel.Position  = UDim2.new(0,10,0,delayRowY())
+            DelayBox.Position    = UDim2.new(0,180,0,delayRowY()+4)
+            RefreshButton.Position = UDim2.new(0,8,0,btnRowY())
+            PauseButton.Position   = UDim2.new(0,46,0,btnRowY())
+            RunButton.Position     = UDim2.new(0,84,0,btnRowY())
+        end)
+        btn.MouseEnter:Connect(function() row.BackgroundColor3 = Color3.fromRGB(55,55,85) end)
+        btn.MouseLeave:Connect(function()
+            row.BackgroundColor3 = configs[idx].selected and Color3.fromRGB(45,55,80) or Color3.fromRGB(35,35,55)
+        end)
+    end
 end
 
-local function refreshConfigs()
-    scanConfigs(); populateDropdown()
+local function refreshAll()
+    scanConfigs()
+    rebuildConfigList()
+    MainFrame.Size = UDim2.new(0,270,0,calcHeight())
+    DelayLabel.Position    = UDim2.new(0,10,0,delayRowY())
+    DelayBox.Position      = UDim2.new(0,180,0,delayRowY()+4)
+    RefreshButton.Position = UDim2.new(0,8,0,btnRowY())
+    PauseButton.Position   = UDim2.new(0,46,0,btnRowY())
+    RunButton.Position     = UDim2.new(0,84,0,btnRowY())
+
+    local sel = getSelectedConfigs()
     if #configs == 0 then
-        StatusLabel.Text = "● Drop .json TAS files into workspace/TAS_Recorder/"
+        StatusLabel.Text       = "● Drop .json files into workspace/TAS_Recorder/"
         StatusLabel.TextColor3 = Color3.fromRGB(220,140,80)
+    elseif #sel == 0 then
+        StatusLabel.Text       = "● " .. #configs .. " config(s) found — tick to select"
+        StatusLabel.TextColor3 = Color3.fromRGB(140,140,180)
     else
-        StatusLabel.Text = "● Ready  (" .. #configs .. " config" .. (#configs==1 and "" or "s") .. ")"
+        StatusLabel.Text       = "● " .. #sel .. " selected  (" .. #configs .. " total)"
         StatusLabel.TextColor3 = Color3.fromRGB(140,140,180)
     end
 end
-
-DropButton.MouseButton1Click:Connect(function()
-    if #configs == 0 then return end
-    dropOpen = not dropOpen; DropList.Visible = dropOpen; DropArrow.Text = dropOpen and "▲" or "▼"
-    local extra = dropOpen and (DropList.Size.Y.Offset + 4) or 0
-    MainFrame.Size         = UDim2.new(0,260,0,BASE_H+extra)
-    DelayLabel.Position    = UDim2.new(0,10,0,123+extra)
-    DelayBox.Position      = UDim2.new(0,125,0,123+extra)
-    RefreshButton.Position = UDim2.new(0,10,0,158+extra)
-    PauseButton.Position   = UDim2.new(0,48,0,158+extra)
-    RunButton.Position     = UDim2.new(0,86,0,158+extra)
-end)
-
-RefreshButton.MouseButton1Click:Connect(function()
-    closeDropdown(); StatusLabel.Text = "● Refreshing..."; task.wait(0.05); refreshConfigs()
-end)
 
 -- ============================================================
 -- UI UPDATE
 -- ============================================================
 local function updateUI()
+    local sel = getSelectedConfigs()
     if not isRunning then
         RunButton.Text             = "▶  Start"
         RunButton.BackgroundColor3 = Color3.fromRGB(60,180,100)
         PauseButton.BackgroundColor3 = Color3.fromRGB(50,50,82)
         PauseButton.Text           = "⏸"
-        if #configs > 0 then
-            StatusLabel.Text       = "● Ready  (" .. #configs .. " config" .. (#configs==1 and "" or "s") .. ")"
+        if #configs == 0 then
+            StatusLabel.Text       = "● Drop .json files into workspace/TAS_Recorder/"
+            StatusLabel.TextColor3 = Color3.fromRGB(220,140,80)
+        elseif #sel == 0 then
+            StatusLabel.Text       = "● " .. #configs .. " config(s) — tick to select"
+            StatusLabel.TextColor3 = Color3.fromRGB(140,140,180)
+        else
+            StatusLabel.Text       = "● " .. #sel .. " selected  (" .. #configs .. " total)"
             StatusLabel.TextColor3 = Color3.fromRGB(140,140,180)
         end
     elseif isPaused then
@@ -530,14 +566,22 @@ local function updateUI()
         RunButton.BackgroundColor3 = Color3.fromRGB(200,60,60)
         PauseButton.Text           = "▶"
         PauseButton.BackgroundColor3 = Color3.fromRGB(200,150,30)
-        StatusLabel.Text           = "⏸ Paused  [frame " .. pausedIdx .. "]"
+        StatusLabel.Text           = "⏸ Paused"
+        StatusLabel.TextColor3     = Color3.fromRGB(255,200,80)
+    elseif waitUntil > 0 then
+        local left = math.ceil(waitUntil - os.clock())
+        RunButton.Text             = "■  Stop"
+        RunButton.BackgroundColor3 = Color3.fromRGB(200,60,60)
+        PauseButton.Text           = "⏸"
+        PauseButton.BackgroundColor3 = Color3.fromRGB(50,50,82)
+        StatusLabel.Text           = "⏳ Next run in " .. math.max(0,left) .. "s..."
         StatusLabel.TextColor3     = Color3.fromRGB(255,200,80)
     else
         RunButton.Text             = "■  Stop"
         RunButton.BackgroundColor3 = Color3.fromRGB(200,60,60)
         PauseButton.Text           = "⏸"
         PauseButton.BackgroundColor3 = Color3.fromRGB(50,50,82)
-        StatusLabel.Text           = "↻ Looping: " .. (configs[selectedIdx] and configs[selectedIdx].name or "?")
+        StatusLabel.Text           = "↻ Running loop"
         StatusLabel.TextColor3     = Color3.fromRGB(100,220,120)
     end
 end
@@ -545,27 +589,38 @@ end
 -- ============================================================
 -- BUTTON WIRING
 -- ============================================================
-PauseButton.MouseButton1Click:Connect(function()
-    if not isRunning then return end
-    togglePause(activeFrames)
-    updateUI()
+RefreshButton.MouseButton1Click:Connect(function()
+    StatusLabel.Text = "● Refreshing..."; task.wait(0.05); refreshAll()
 end)
 
-RunButton.MouseButton1Click:Connect(function()
-    if isRunning then
-        stopRun()
+PauseButton.MouseButton1Click:Connect(function()
+    if not isRunning then return end
+    isPaused = not isPaused
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if isPaused then
+        if root then root.Anchored = true end
     else
-        startRun(StatusLabel, PauseButton)
+        if root then root.Anchored = false end
+        -- Re-sync startTime for the current config so it resumes smoothly
+        if activeSelectedList then
+            startPlaybackLoop(activeSelectedList, 1, 1)
+        end
     end
     updateUI()
 end)
 
+RunButton.MouseButton1Click:Connect(function()
+    if isRunning then stopRun() else startRun() end
+    updateUI()
+end)
+
 task.spawn(function()
-    while true do task.wait(0.25); updateUI() end
+    while true do task.wait(0.2); updateUI() end
 end)
 
 -- ============================================================
 -- INIT
 -- ============================================================
-refreshConfigs()
-print("[TAS] GUI ready. Folder: workspace/" .. FOLDER .. "/")
+refreshAll()
+print("[TAS] GUI ready — workspace/" .. FOLDER .. "/")
