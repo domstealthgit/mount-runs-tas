@@ -175,9 +175,17 @@ local function startPlaybackLoop(frames, startIdx)
     end
 
     -- Offset startTime so elapsed matches frames[startIdx].T
-    local originT   = frames[startIdx] and frames[startIdx].T or 0
-    local startTime = os.clock() - originT
+    local startTime  = os.clock() - (frames[startIdx] and frames[startIdx].T or 0)
     local currentIdx = startIdx
+
+    -- waitUntil > 0 means we are frozen at frame 1 waiting for the delay
+    local waitUntil = (delaySeconds > 0) and (os.clock() + delaySeconds) or 0
+
+    -- Freeze at frame 1 for the initial delay
+    if waitUntil > 0 then
+        applyFrame(frames[1])
+        if root then root.Anchored = true end
+    end
 
     if playConn then playConn:Disconnect() end
 
@@ -188,6 +196,15 @@ local function startPlaybackLoop(frames, startIdx)
         root = char and char:FindFirstChild("HumanoidRootPart")
         hum  = char and char:FindFirstChild("Humanoid")
         if not root then return end
+
+        -- Sitting at frame 1 waiting for delay to expire
+        if waitUntil > 0 then
+            if os.clock() < waitUntil then return end
+            -- Delay over: unanchor and sync the timer
+            root.Anchored = false
+            startTime     = os.clock() - (frames[1].T or 0)
+            waitUntil     = 0
+        end
 
         local elapsed = os.clock() - startTime
 
@@ -226,13 +243,18 @@ local function startPlaybackLoop(frames, startIdx)
                 end
             end
         else
-            -- End of frames → LOOP back to beginning
+            -- End of run → freeze at frame 1, wait delay, then loop
             if not isRunning then return end
-            originT    = frames[1].T
-            startTime  = os.clock() - originT
             currentIdx = 1
             pausedIdx  = 1
             applyFrame(frames[1])
+            if delaySeconds > 0 then
+                if root then root.Anchored = true end
+                waitUntil = os.clock() + delaySeconds
+            else
+                waitUntil = 0
+                startTime = os.clock() - (frames[1].T or 0)
+            end
         end
     end)
 end
@@ -506,7 +528,7 @@ local function updateUI()
     elseif isPaused then
         RunButton.Text             = "■  Stop"
         RunButton.BackgroundColor3 = Color3.fromRGB(200,60,60)
-        PauseButton.Text           = "▶"   -- resume icon
+        PauseButton.Text           = "▶"
         PauseButton.BackgroundColor3 = Color3.fromRGB(200,150,30)
         StatusLabel.Text           = "⏸ Paused  [frame " .. pausedIdx .. "]"
         StatusLabel.TextColor3     = Color3.fromRGB(255,200,80)
